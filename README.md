@@ -30,7 +30,7 @@ An ESP32-based Direct-On-Line (DOL) starter controller for 3-phase AC motors. Th
 | I2C SDA       | GPIO21    |
 | I2C SCL       | GPIO22    |
 
-## Getting Started with calibrTION
+## Getting Started with calibration 
 1. Upload `calibration.ino`, run it with zero current to get baseline voltages.
 2. Save those zero values and, if needed, update them in the main sketch.
 3. Upload `main.ino` and observe the LCD for real-time feedback.

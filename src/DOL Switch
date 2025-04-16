@@ -1,0 +1,435 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+
+// === Hardware Config ===
+const byte ACS712_PINS[] = {34, 35, 36};  // L1, L2, L3
+const int PC817_PIN = 4;                  // Opto-isolator control
+const int CALIBRATION_SAMPLES = 1000;     // For zero-current calibration
+const int CALIBRATION_DELAY = 5;          // Delay between calibration samples
+
+// === Sensor Characteristics ===
+const float SENSITIVITY[] = {0.066, 0.066, 0.100}; // V/A (30A,30A,20A)
+
+// === Protection Settings (6A Load) ===
+const float OVERCURRENT_TRIP = 7.0;       // 16% above 6A
+const float RESTART_THRESHOLD = 2.0;      // 33% of max load
+const float IMBALANCE_LIMIT = 1.0;        // 16% of max load
+const unsigned long TRIP_LOCKOUT_TIME = 5000; // ms to wait before auto-restart attempt
+
+// === LCD Config ===
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// === Calibration Variables ===
+float zeroVoltages[3] = {0};
+float noiseLevel = 0;           // Global noise level from calibration
+float threshold = 0.5;          // Current threshold, will update after calibration
+bool calibrationOK = true;      // Flag for successful calibration
+
+// === System State Variables ===
+unsigned long lastTripTime = 0;
+int tripCount = 0;
+const int MAX_TRIP_COUNT = 3;   // Maximum number of auto-restart attempts
+
+// === Serial LCD Mirror Variables ===
+char lcdBuffer[2][17];  // Buffer to store LCD content (16 chars + null terminator)
+bool lcdBufferChanged = true;   // Flag to track if buffer changed
+
+void setup() {
+  pinMode(PC817_PIN, OUTPUT);
+  digitalWrite(PC817_PIN, LOW); // Start with load OFF
+
+  // Initialize serial at high baud rate for debugging
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000); // Wait for serial connection for up to 3 seconds
+  
+  Serial.println("\n\n=== Three-Phase Current Monitor ===");
+  Serial.println("Starting system...");
+  
+  // Clear LCD buffer
+  clearLCDBuffer();
+  
+  lcd.init();
+  lcd.backlight();
+  
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  // Initialize the LCD layout once
+  initLCDLayout();
+  
+  // Calibrate zero points first
+  calibrateZeroPoints();
+  
+  // Then perform noise level calibration
+  calibrateCurrentSensors();
+  
+  if (calibrationOK) {
+    lcdPrint(0, 0, "System Ready");
+    lcdPrint(0, 1, "Threshold: ");
+    lcdPrint(11, 1, String(threshold, 2));
+    updateSerialDisplay();
+    delay(2000);
+    
+    // Re-initialize the display layout
+    initLCDLayout();
+  }
+}
+
+void loop() {
+  // Skip or show warning if calibration failed
+  if (!calibrationOK) {
+    static unsigned long lastUpdate = 0;
+    unsigned long currentTime = millis();
+    
+    // Update warning message only once per second to avoid flicker
+    if (currentTime - lastUpdate > 1000) {
+      clearLCDBuffer();
+      lcdPrint(0, 0, "Check Sensors!");
+      lcdPrint(0, 1, "Recalibrate System");
+      updateSerialDisplay();
+      lastUpdate = currentTime;
+    }
+    return;
+  }
+
+  static bool loadState = false;
+  float currents[3];
+  float avgCurrent = 0;
+  bool trip = false;
+  String tripMessage = "";
+
+  // Measure all phases
+  for (int i = 0; i < 3; i++) {
+    currents[i] = getFilteredCurrent(i);
+    
+    // Apply dynamic threshold from calibration
+    if (abs(currents[i]) < threshold) {
+      currents[i] = 0.0;
+    }
+    
+    avgCurrent += currents[i];
+
+    // Protection checks
+    if (currents[i] > OVERCURRENT_TRIP) {
+      trip = true;
+      tripMessage = "PH" + String(i+1) + " OVERCURRENT";
+    }
+  }
+  avgCurrent /= 3.0;
+  
+  // Check phase imbalance
+  for (int i = 0; i < 3; i++) {
+    for (int j = i+1; j < 3; j++) {
+      if (abs(currents[i] - currents[j]) > IMBALANCE_LIMIT) {
+        trip = true;
+        tripMessage = "IMBAL PH" + String(i+1) + "-PH" + String(j+1);
+      }
+    }
+  }
+
+  // Protection logic
+  if (trip) {
+    digitalWrite(PC817_PIN, LOW);
+    loadState = false;
+    lastTripTime = millis();
+    tripCount++;
+    displayTrip(tripMessage);
+    
+    // Log trip event
+    Serial.print("\n*** TRIP EVENT: ");
+    Serial.print(tripMessage);
+    Serial.println(" ***");
+  } else {
+    // Auto-restart logic with lockout time and retry limits
+    unsigned long currentTime = millis();
+    if (!loadState && 
+        avgCurrent < RESTART_THRESHOLD && 
+        (currentTime - lastTripTime > TRIP_LOCKOUT_TIME) &&
+        (tripCount < MAX_TRIP_COUNT || (currentTime - lastTripTime > 60000))) {
+      
+      digitalWrite(PC817_PIN, HIGH);
+      loadState = true;
+      
+      // Reset trip counter after 1 minute of successful operation
+      if (currentTime - lastTripTime > 60000) {
+        tripCount = 0;
+      }
+      
+      Serial.println("\n=== LOAD RECONNECTED ===");
+    }
+    displayCurrents(currents, avgCurrent, loadState);
+  }
+
+  // Update serial display if LCD content changed
+  if (lcdBufferChanged) {
+    updateSerialDisplay();
+    lcdBufferChanged = false;
+  }
+
+  delay(200); // 5Hz update rate
+}
+
+// Initialize LCD buffer with empty spaces
+void clearLCDBuffer() {
+  for (int row = 0; row < 2; row++) {
+    for (int col = 0; col < 16; col++) {
+      lcdBuffer[row][col] = ' ';
+    }
+    lcdBuffer[row][16] = '\0'; // Null-terminate the string
+  }
+  lcdBufferChanged = true;
+  
+  // Clear the actual LCD
+  lcd.clear();
+}
+
+// Custom print function that updates both LCD and buffer
+void lcdPrint(int col, int row, String text) {
+  // Update physical LCD
+  lcd.setCursor(col, row);
+  lcd.print(text);
+  
+  // Update buffer
+  int len = min((int)text.length(), 16 - col);
+  for (int i = 0; i < len; i++) {
+    if (lcdBuffer[row][col + i] != text[i]) {
+      lcdBuffer[row][col + i] = text[i];
+      lcdBufferChanged = true;
+    }
+  }
+}
+
+// Display LCD buffer on serial monitor
+void updateSerialDisplay() {
+  Serial.println("\n+----------------+");
+  Serial.print("|");
+  Serial.print(lcdBuffer[0]);
+  Serial.println("|");
+  Serial.print("|");
+  Serial.print(lcdBuffer[1]);
+  Serial.println("|");
+  Serial.println("+----------------+");
+}
+
+void initLCDLayout() {
+  // Set up the fixed parts of the display once
+  clearLCDBuffer();
+  lcdPrint(0, 0, "L1:     L2:    ");
+  lcdPrint(0, 1, "L3:     A:     ");
+  updateSerialDisplay();
+}
+
+void calibrateZeroPoints() {
+  clearLCDBuffer();
+  lcdPrint(0, 0, "Zero Calibration");
+  updateSerialDisplay();
+  
+  for (int i = 0; i < 3; i++) {
+    lcdPrint(0, 1, "Phase ");
+    lcdPrint(6, 1, String(i+1));
+    lcdPrint(7, 1, " of 3    ");
+    updateSerialDisplay();
+    
+    Serial.print("\nCalibrating zero point for Phase ");
+    Serial.print(i+1);
+    Serial.println("...");
+    
+    long sum = 0;
+    for (int j = 0; j < CALIBRATION_SAMPLES; j++) {
+      sum += analogRead(ACS712_PINS[i]);
+      
+      // Update progress less frequently to reduce I2C traffic
+      if (j % 50 == 0) {
+        int progress = (j * 100) / CALIBRATION_SAMPLES;
+        lcdPrint(10, 1, String(progress));
+        lcdPrint(12, 1, "%  ");
+        updateSerialDisplay();
+      }
+      delay(CALIBRATION_DELAY);
+    }
+    
+    zeroVoltages[i] = (sum / (float)CALIBRATION_SAMPLES) * (3.3 / 4095.0);
+    
+    Serial.print("Zero voltage L");
+    Serial.print(i+1);
+    Serial.print(": ");
+    Serial.println(zeroVoltages[i], 5);
+  }
+}
+
+void calibrateCurrentSensors() {
+  clearLCDBuffer();
+  lcdPrint(0, 0, "Calibrating...");
+  updateSerialDisplay();
+  
+  Serial.println("\nPerforming noise calibration...");
+  
+  noiseLevel = 0;
+  
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    float current = 0;
+    for (int j = 0; j < 3; j++) {
+      current += readCurrent(j);
+    }
+    current /= 3.0;
+    
+    noiseLevel = (noiseLevel * i + current) / (i + 1);
+    
+    // Update progress less frequently to reduce I2C traffic
+    if (i % 50 == 0) {
+      int progress = (100 * i) / CALIBRATION_SAMPLES;
+      lcdPrint(0, 1, "Progress: ");
+      lcdPrint(10, 1, String(progress));
+      lcdPrint(12, 1, "% ");
+      updateSerialDisplay();
+    }
+    
+    delay(CALIBRATION_DELAY);
+  }
+  
+  // Set dynamic threshold
+  threshold = noiseLevel + 0.2;
+  
+  clearLCDBuffer();
+  lcdPrint(0, 0, "Noise Level:");
+  lcdPrint(0, 1, String(noiseLevel, 3));
+  updateSerialDisplay();
+  
+  Serial.print("Measured noise level: ");
+  Serial.println(noiseLevel, 5);
+  Serial.print("Current threshold set to: ");
+  Serial.println(threshold, 5);
+  
+  delay(3000);
+  
+  // Check for faulty sensor
+  if (noiseLevel > 1.0) {
+    calibrationOK = false;
+    clearLCDBuffer();
+    lcdPrint(0, 0, "Sensor Noise");
+    lcdPrint(0, 1, "Too High!");
+    updateSerialDisplay();
+    
+    Serial.println("\n!!! WARNING: SENSOR NOISE TOO HIGH !!!");
+    Serial.println("Check sensor connections and environment");
+    
+    delay(5000);
+  } else {
+    calibrationOK = true;
+    clearLCDBuffer();
+    lcdPrint(0, 0, "Calibration OK");
+    updateSerialDisplay();
+    
+    Serial.println("\nCalibration successful!");
+    
+    delay(2000);
+  }
+}
+
+float readCurrent(int phase) {
+  float voltage = analogRead(ACS712_PINS[phase]) * (3.3 / 4095.0);
+  return abs((voltage - zeroVoltages[phase]) / SENSITIVITY[phase]);
+}
+
+float getInstantCurrent(int phase) {
+  return readCurrent(phase);
+}
+
+float getFilteredCurrent(int phase) {
+  // Improved moving average filter
+  static float history[3][10] = {0};
+  static byte index = 0;
+  
+  float current = getInstantCurrent(phase);
+  history[phase][index] = current;
+  
+  float sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += history[phase][i];
+  }
+  
+  index = (index + 1) % 10;
+  return sum / 10.0;
+}
+
+void displayCurrents(float currents[], float avg, bool loadConnected) {
+  // Store previous values to only update when changed
+  static float prevCurrents[3] = {-1, -1, -1};
+  static float prevAvg = -1;
+  static bool prevState = !loadConnected;
+  bool valuesChanged = false;
+  
+  // Only update display values if they've changed significantly (>0.1A)
+  if (abs(prevCurrents[0] - currents[0]) > 0.1) {
+    String val = String(currents[0], 1) + " ";
+    lcdPrint(3, 0, val);
+    prevCurrents[0] = currents[0];
+    valuesChanged = true;
+  }
+  
+  if (abs(prevCurrents[1] - currents[1]) > 0.1) {
+    String val = String(currents[1], 1) + " ";
+    lcdPrint(10, 0, val);
+    prevCurrents[1] = currents[1];
+    valuesChanged = true;
+  }
+  
+  if (abs(prevCurrents[2] - currents[2]) > 0.1) {
+    String val = String(currents[2], 1) + " ";
+    lcdPrint(3, 1, val);
+    prevCurrents[2] = currents[2];
+    valuesChanged = true;
+  }
+  
+  if (abs(prevAvg - avg) > 0.1) {
+    String val = String(avg, 1) + " ";
+    lcdPrint(10, 1, val);
+    prevAvg = avg;
+    valuesChanged = true;
+  }
+  
+  // Only update ON/OFF status if it changed
+  if (prevState != loadConnected) {
+    lcdPrint(13, 1, loadConnected ? "ON " : "OFF");
+    prevState = loadConnected;
+    valuesChanged = true;
+  }
+  
+  // Print values to serial periodically regardless of LCD changes
+  static unsigned long lastSerialUpdate = 0;
+  if (valuesChanged || millis() - lastSerialUpdate > 5000) { // Update every 5 seconds minimum
+    Serial.print("\nCurrent readings - L1: ");
+    Serial.print(currents[0], 2);
+    Serial.print("A, L2: ");
+    Serial.print(currents[1], 2);
+    Serial.print("A, L3: ");
+    Serial.print(currents[2], 2);
+    Serial.print("A, Avg: ");
+    Serial.print(avg, 2);
+    Serial.print("A, Load: ");
+    Serial.println(loadConnected ? "ON" : "OFF");
+    
+    lastSerialUpdate = millis();
+    
+    // If values changed, update the serial display of LCD
+    if (valuesChanged) {
+      updateSerialDisplay();
+    }
+  }
+}
+
+void displayTrip(String message) {
+  static String prevMessage = "";
+  
+  // Only redraw if message changed
+  if (prevMessage != message) {
+    clearLCDBuffer();
+    lcdPrint(0, 0, "TRIP: " + message);
+    prevMessage = message;
+  }
+  
+  // Always update the retry count
+  lcdPrint(0, 1, "Retry: " + String(tripCount) + "/" + String(MAX_TRIP_COUNT) + "    ");
+  updateSerialDisplay();
+}

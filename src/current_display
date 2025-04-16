@@ -1,0 +1,103 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// Hardware Configuration
+const byte ACS712_PINS[] = {34, 35, 36};  // L1, L2, L3
+const int LCD_COLS = 16;
+const int LCD_ROWS = 2;
+
+// Calibration Values from Your Output
+const float ZERO_VOLTAGES[] = {1.3999, 1.3986, 0.8785};  // Your calibration values
+const float NOISE_THRESHOLDS[] = {0.29, 0.18, 0.11};     // 50% above your measured noise
+const float SENSITIVITY[] = {0.066, 0.066, 0.100};       // V/A for 30A,30A,20A sensors
+
+LiquidCrystal_I2C lcd(0x27, LCD_COLS, LCD_ROWS);  // I2C address 0x27
+
+// Moving average filters
+const int FILTER_SIZE = 5;
+float currentHistory[3][FILTER_SIZE] = {0};
+int historyIndex = 0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("3-Phase Monitor");
+  lcd.setCursor(0, 1);
+  lcd.print("Calibrated v1.0");
+  
+  // Configure ADC
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  float currents[3];
+  float filteredCurrents[3];
+  float avgCurrent = 0;
+  
+  // Read and process all three phases
+  for (int i = 0; i < 3; i++) {
+    currents[i] = readCurrent(i);
+    currentHistory[i][historyIndex] = currents[i];
+    filteredCurrents[i] = applyFilter(i);
+    
+    // Apply noise threshold
+    if (abs(filteredCurrents[i]) < NOISE_THRESHOLDS[i]) {
+      filteredCurrents[i] = 0.0;
+    }
+    
+    avgCurrent += filteredCurrents[i];
+  }
+  
+  historyIndex = (historyIndex + 1) % FILTER_SIZE;
+  avgCurrent /= 3.0;
+
+  // Display on LCD
+  updateDisplay(filteredCurrents, avgCurrent);
+  
+  // Serial output for debugging
+  Serial.printf("Raw: L1=%.2f L2=%.2f L3=%.2f | Filtered: L1=%.2f L2=%.2f L3=%.2f\n",
+               currents[0], currents[1], currents[2],
+               filteredCurrents[0], filteredCurrents[1], filteredCurrents[2]);
+  
+  delay(200);  // Update rate (5Hz)
+}
+
+float readCurrent(int phase) {
+  int raw = analogRead(ACS712_PINS[phase]);
+  float voltage = raw * (3.3 / 4095.0);
+  return (voltage - ZERO_VOLTAGES[phase]) / SENSITIVITY[phase];
+}
+
+float applyFilter(int phase) {
+  float sum = 0;
+  for (int i = 0; i < FILTER_SIZE; i++) {
+    sum += currentHistory[phase][i];
+  }
+  return sum / FILTER_SIZE;
+}
+
+void updateDisplay(float currents[], float avg) {
+  // Line 1: L1 and L2 currents
+  lcd.setCursor(0, 0);
+  lcd.print("L1:");
+  lcd.print(currents[0], 1);
+  lcd.print(" L2:");
+  lcd.print(currents[1], 1);
+  lcd.print("  ");  // Clear any leftovers
+  
+  // Line 2: L3 and average
+  lcd.setCursor(0, 1);
+  lcd.print("L3:");
+  lcd.print(currents[2], 1);
+  lcd.print(" Avg:");
+  lcd.print(avg, 1);
+  lcd.print("  ");
+}

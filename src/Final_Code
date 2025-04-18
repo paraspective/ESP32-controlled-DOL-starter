@@ -1,0 +1,729 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// === Hardware Configuration ===
+const byte ACS712_PINS[] = {34, 35, 36};  // L1, L2, L3 current sensors
+const int PC817_PIN = 4;                  // Opto-isolator for load control
+const int CALIBRATION_SAMPLES = 1000;     // Number of samples for calibration
+const int CALIBRATION_DELAY = 5;          // Delay between calibration samples (ms)
+
+// === Sensor Characteristics ===
+const float SENSITIVITY[] = {0.066, 0.066, 0.100}; // V/A for 30A, 30A, 20A sensors
+
+// === Protection Settings ===
+const float OVERCURRENT_TRIP = 7.0;       // Trip current threshold (A)
+const float RESTART_THRESHOLD = 2.0;      // Safe current for restart (A)
+const float IMBALANCE_LIMIT = 1.0;        // Maximum allowed phase imbalance (A)
+const float MIN_CURRENT_FOR_IMBALANCE_CHECK = 0.5; // Min current to check imbalance (A)
+const unsigned long TRIP_LOCKOUT_TIME = 5000;  // Lockout time before restart (ms)
+const unsigned long TRIP_RESET_TIME = 60000;   // Time to reset trip counter (ms)
+const int MAX_TRIP_COUNT = 3;             // Maximum auto-restart attempts
+
+// === LCD Configuration ===
+LiquidCrystal_I2C lcd(0x27, 16, 2);      // LCD address 0x27, 16x2 display
+char lcdBuffer[2][17];                    // Buffer for LCD content (16 chars + null)
+bool lcdBufferChanged = false;            // Flag to track buffer changes
+
+// === Calibration Variables ===
+float zeroVoltages[3] = {0};              // Zero-current voltage reference
+float noiseLevel = 0;                     // Measured noise level
+float threshold = 0.5;                    // Dynamic current threshold
+bool calibrationOK = true;                // Flag for successful calibration
+bool sensorStatus[3] = {true, true, true}; // Status of each sensor
+
+// === System State Variables ===
+unsigned long lastTripTime = 0;           // Timestamp of last trip event
+int tripCount = 0;                        // Counter for trip events
+bool loadState = false;                   // Current load connection state
+float currents[3] = {0};                  // Current readings for each phase
+float avgCurrent = 0;                     // Average current across phases
+String lastTripMessage = "";              // Last trip message displayed
+
+void setup() {
+  // Initialize hardware pins
+  pinMode(PC817_PIN, OUTPUT);
+  digitalWrite(PC817_PIN, LOW);          // Start with load disconnected
+  
+  // Initialize serial communication
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);    // Wait up to 3s for serial connection
+  
+  Serial.println("\n\n=== Three-Phase Current Monitor ===");
+  Serial.println("Starting system...");
+  
+  // Initialize LCD
+  clearLCDBuffer();
+  lcd.init();
+  lcd.backlight();
+  
+  // Configure ADC
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  
+  // Initialize the LCD layout
+  initLCDLayout();
+  
+  // First check if all sensors are connected
+  checkSensorsConnected();
+  
+  // Perform sensor calibration if all sensors OK
+  if (calibrationOK) {
+    performCalibration();
+  }
+  
+  // Show ready message if calibration succeeded
+  if (calibrationOK) {
+    clearLCDBuffer();
+    lcdPrint(0, 0, "System Ready     ");
+    lcdPrint(0, 1, "Threshold:");
+    lcdPrint(10, 1, String(threshold, 2));
+    updateSerialDisplay();
+    delay(2000);
+    
+    // Reset the LCD layout
+    initLCDLayout();
+  }
+}
+
+void loop() {
+  // Handle failed calibration case
+  if (!calibrationOK) {
+    handleFailedCalibration();
+    return;
+  }
+
+  // Measure current on all phases
+  measureCurrents();
+  
+  // Check for fault conditions
+  String tripMessage = checkForFaults();
+  
+  // Update load state based on protection logic
+  updateLoadState(tripMessage);
+  
+  // Update the display
+  updateDisplay(tripMessage);
+  
+  // Update serial mirror if LCD content changed
+  if (lcdBufferChanged) {
+    updateSerialDisplay();
+    lcdBufferChanged = false;
+  }
+
+  delay(200); // 5Hz update rate
+}
+
+//==============================================================================
+// SENSOR CONNECTION CHECK
+//==============================================================================
+
+void checkSensorsConnected() {
+  clearLCDBuffer();
+  lcdPrint(0, 0, "Checking Sensors ");
+  updateSerialDisplay();
+  
+  bool allSensorsOK = true;
+  
+  for (int i = 0; i < 3; i++) {
+    // Read multiple samples to confirm sensor presence
+    int sampleCount = 20;
+    int readings[20];
+    int sum = 0;
+    int min_val = 4095;
+    int max_val = 0;
+    
+    lcdPrint(0, 1, "Phase " + String(i+1) + " ...     ");
+    updateSerialDisplay();
+    
+    for (int j = 0; j < sampleCount; j++) {
+      readings[j] = analogRead(ACS712_PINS[i]);
+      sum += readings[j];
+      
+      if (readings[j] < min_val) min_val = readings[j];
+      if (readings[j] > max_val) max_val = readings[j];
+      
+      delay(5);
+    }
+    
+    float avg = sum / (float)sampleCount;
+    
+    // A disconnected sensor typically reads either all zeros, all max values, 
+    // or has very little variation between readings
+    if ((max_val - min_val) < 5 || avg < 10 || avg > 4085) {
+      sensorStatus[i] = false;
+      allSensorsOK = false;
+      
+      clearLCDBuffer();
+      lcdPrint(0, 0, "ERROR: Phase " + String(i+1));
+      lcdPrint(0, 1, "Sensor Missing!  ");
+      updateSerialDisplay();
+      
+      Serial.print("ERROR: Phase ");
+      Serial.print(i+1);
+      Serial.print(" sensor not connected! (avg=");
+      Serial.print(avg);
+      Serial.print(", min=");
+      Serial.print(min_val);
+      Serial.print(", max=");
+      Serial.print(max_val);
+      Serial.println(")");
+      
+      delay(3000);
+    } else {
+      sensorStatus[i] = true;
+      Serial.print("Phase ");
+      Serial.print(i+1);
+      Serial.println(" sensor connected.");
+    }
+  }
+  
+  calibrationOK = allSensorsOK;
+  
+  if (calibrationOK) {
+    clearLCDBuffer();
+    lcdPrint(0, 0, "All Sensors OK   ");
+    updateSerialDisplay();
+    delay(1000);
+  }
+}
+
+//==============================================================================
+// CALIBRATION FUNCTIONS
+//==============================================================================
+
+void performCalibration() {
+  // Step 1: Calibrate zero-current reference points
+  calibrateZeroPoints();
+  
+  // Step 2: Measure noise level and set threshold
+  calibrateNoiseLevel();
+}
+
+void calibrateZeroPoints() {
+  clearLCDBuffer();
+  lcdPrint(0, 0, "Zero Calibration");
+  updateSerialDisplay();
+  
+  for (int phase = 0; phase < 3; phase++) {
+    // Skip calibration for disconnected sensors
+    if (!sensorStatus[phase]) {
+      zeroVoltages[phase] = 1.65; // Use midpoint voltage as default
+      continue;
+    }
+    
+    lcdPrint(0, 1, "Phase " + String(phase+1) + " of 3    ");
+    updateSerialDisplay();
+    
+    Serial.print("\nCalibrating zero point for Phase ");
+    Serial.print(phase+1);
+    Serial.println("...");
+    
+    long sum = 0;
+    for (int sample = 0; sample < CALIBRATION_SAMPLES; sample++) {
+      sum += analogRead(ACS712_PINS[phase]);
+      
+      // Update progress less frequently
+      if (sample % 50 == 0) {
+        int progress = (sample * 100) / CALIBRATION_SAMPLES;
+        lcdPrint(10, 1, String(progress) + "%  ");
+        updateSerialDisplay();
+      }
+      delay(CALIBRATION_DELAY);
+    }
+    
+    zeroVoltages[phase] = (sum / (float)CALIBRATION_SAMPLES) * (3.3 / 4095.0);
+    
+    Serial.print("Zero voltage L");
+    Serial.print(phase+1);
+    Serial.print(": ");
+    Serial.println(zeroVoltages[phase], 5);
+  }
+}
+
+void calibrateNoiseLevel() {
+  clearLCDBuffer();
+  lcdPrint(0, 0, "Noise Calibration");
+  updateSerialDisplay();
+  
+  Serial.println("\nPerforming noise calibration...");
+  
+  // Reset noise level
+  noiseLevel = 0;
+  int validSensors = 0;
+  
+  for (int sample = 0; sample < CALIBRATION_SAMPLES; sample++) {
+    float currentSum = 0;
+    validSensors = 0;
+    
+    for (int phase = 0; phase < 3; phase++) {
+      if (sensorStatus[phase]) {
+        currentSum += readCurrent(phase);
+        validSensors++;
+      }
+    }
+    
+    float avgSample = 0;
+    if (validSensors > 0) {
+      avgSample = currentSum / validSensors;
+    } else {
+      calibrationOK = false;
+      clearLCDBuffer();
+      lcdPrint(0, 0, "No Valid Sensors!");
+      lcdPrint(0, 1, "Check Wiring    ");
+      updateSerialDisplay();
+      delay(5000);
+      return;
+    }
+    
+    // Running average of noise
+    noiseLevel = (noiseLevel * sample + avgSample) / (sample + 1);
+    
+    // Update progress less frequently
+    if (sample % 50 == 0) {
+      int progress = (sample * 100) / CALIBRATION_SAMPLES;
+      lcdPrint(0, 1, "Progress: " + String(progress) + "%");
+      updateSerialDisplay();
+    }
+    
+    delay(CALIBRATION_DELAY);
+  }
+  
+  // Set dynamic threshold with safety margin
+  threshold = noiseLevel * 1.5 + 0.2;
+  
+  clearLCDBuffer();
+  lcdPrint(0, 0, "Noise: " + String(noiseLevel, 3));
+  lcdPrint(0, 1, "Threshold: " + String(threshold, 3));
+  updateSerialDisplay();
+  
+  Serial.print("Measured noise level: ");
+  Serial.println(noiseLevel, 5);
+  Serial.print("Current threshold set to: ");
+  Serial.println(threshold, 5);
+  
+  delay(3000);
+  
+  // Validate calibration results
+  if (noiseLevel > 0.5) {
+    calibrationOK = false;
+    clearLCDBuffer();
+    lcdPrint(0, 0, "Sensor Noise     ");
+    lcdPrint(0, 1, "Too High!        ");
+    updateSerialDisplay();
+    
+    Serial.println("\n!!! WARNING: SENSOR NOISE TOO HIGH !!!");
+    Serial.println("Check sensor connections and environment");
+    
+    delay(5000);
+  } else {
+    calibrationOK = true;
+    clearLCDBuffer();
+    lcdPrint(0, 0, "Calibration OK   ");
+    updateSerialDisplay();
+    
+    Serial.println("\nCalibration successful!");
+    
+    delay(2000);
+  }
+}
+
+void handleFailedCalibration() {
+  static unsigned long lastWarningUpdate = 0;
+  unsigned long currentTime = millis();
+  
+  // Update warning message once per second
+  if (currentTime - lastWarningUpdate > 1000) {
+    clearLCDBuffer();
+    lcdPrint(0, 0, "Check Sensors!   ");
+    lcdPrint(0, 1, "Restart System   ");
+    updateSerialDisplay();
+    lastWarningUpdate = currentTime;
+  }
+}
+
+//==============================================================================
+// CURRENT MEASUREMENT FUNCTIONS
+//==============================================================================
+
+float readCurrent(int phase) {
+  // Skip reading for disconnected sensors
+  if (!sensorStatus[phase]) {
+    return 0.0;
+  }
+  
+  float voltage = analogRead(ACS712_PINS[phase]) * (3.3 / 4095.0);
+  return abs((voltage - zeroVoltages[phase]) / SENSITIVITY[phase]);
+}
+
+float getFilteredCurrent(int phase) {
+  // Moving average filter (10 samples)
+  static float history[3][10] = {0};
+  static byte index = 0;
+  
+  // Get current reading and store in history
+  float current = readCurrent(phase);
+  history[phase][index] = current;
+  
+  // Calculate average from history
+  float sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += history[phase][i];
+  }
+  
+  // Update index for next reading
+  index = (index + 1) % 10;
+  
+  return sum / 10.0;
+}
+
+void measureCurrents() {
+  // Reset average current
+  avgCurrent = 0;
+  
+  // Measure current on each phase
+  for (int phase = 0; phase < 3; phase++) {
+    // Get filtered current reading
+    currents[phase] = getFilteredCurrent(phase);
+    
+    // Apply dynamic noise threshold
+    if (currents[phase] < threshold) {
+      currents[phase] = 0.0;
+    }
+    
+    // Add to average
+    avgCurrent += currents[phase];
+  }
+  
+  // Calculate average current
+  avgCurrent /= 3.0;
+}
+
+//==============================================================================
+// PROTECTION LOGIC FUNCTIONS
+//==============================================================================
+
+String checkForFaults() {
+  // Check for overcurrent on any phase
+  for (int phase = 0; phase < 3; phase++) {
+    if (currents[phase] > OVERCURRENT_TRIP) {
+      return "OC PH" + String(phase+1);
+    }
+  }
+  
+  // Check for phase imbalance - only if average current is significant
+  if (avgCurrent > MIN_CURRENT_FOR_IMBALANCE_CHECK) {
+    for (int i = 0; i < 3; i++) {
+      for (int j = i+1; j < 3; j++) {
+        if (abs(currents[i] - currents[j]) > IMBALANCE_LIMIT) {
+          return "IMB P" + String(i+1) + "-P" + String(j+1);
+        }
+      }
+    }
+  }
+  
+  // No faults detected
+  return "";
+}
+
+void updateLoadState(const String &tripMessage) {
+  // Check if we have a trip condition
+  if (tripMessage.length() > 0) {
+    // Trip detected, disconnect load
+    if (loadState) {
+      digitalWrite(PC817_PIN, LOW);
+      loadState = false;
+      lastTripTime = millis();
+      
+      // Prevent trip count overflow
+      if (tripCount < 999) {
+        tripCount++;
+      }
+      
+      // Store the trip message
+      lastTripMessage = tripMessage;
+      
+      // Log trip event
+      Serial.print("\n*** TRIP EVENT: ");
+      Serial.print(tripMessage);
+      Serial.println(" ***");
+    }
+  } else {
+    // No trip condition, check if we can auto-restart
+    unsigned long currentTime = millis();
+    
+    // Auto-restart logic with lockout time and retry limits
+    if (!loadState && 
+        avgCurrent < RESTART_THRESHOLD && 
+        (currentTime - lastTripTime > TRIP_LOCKOUT_TIME) &&
+        (tripCount < MAX_TRIP_COUNT || (currentTime - lastTripTime > TRIP_RESET_TIME))) {
+      
+      digitalWrite(PC817_PIN, HIGH);
+      loadState = true;
+      
+      // Reset trip counter after extended successful operation
+      if (currentTime - lastTripTime > TRIP_RESET_TIME) {
+        tripCount = 0;
+        Serial.println("Trip counter reset after stable operation");
+      }
+      
+      Serial.println("\n=== LOAD RECONNECTED ===");
+    }
+  }
+}
+
+//==============================================================================
+// DISPLAY FUNCTIONS
+//==============================================================================
+
+void clearLCDBuffer() {
+  for (int row = 0; row < 2; row++) {
+    for (int col = 0; col < 16; col++) {
+      lcdBuffer[row][col] = ' ';
+    }
+    lcdBuffer[row][16] = '\0'; // Null-terminate
+  }
+  lcdBufferChanged = true;
+  
+  // Clear physical LCD
+  lcd.clear();
+}
+
+void lcdPrint(int col, int row, String text) {
+  // Bounds checking
+  if (row < 0 || row > 1 || col < 0 || col > 15) return;
+  if (col + text.length() > 16) text = text.substring(0, 16 - col);
+  
+  // Update physical LCD
+  lcd.setCursor(col, row);
+  lcd.print(text);
+  
+  // Update buffer
+  bool changed = false;
+  for (int i = 0; i < text.length(); i++) {
+    if (lcdBuffer[row][col + i] != text[i]) {
+      lcdBuffer[row][col + i] = text[i];
+      changed = true;
+    }
+  }
+  
+  if (changed) {
+    lcdBufferChanged = true;
+  }
+}
+
+void updateSerialDisplay() {
+  Serial.println("\n+----------------+");
+  Serial.print("|");
+  Serial.print(lcdBuffer[0]);
+  Serial.println("|");
+  Serial.print("|");
+  Serial.print(lcdBuffer[1]);
+  Serial.println("|");
+  Serial.println("+----------------+");
+}
+
+void initLCDLayout() {
+  // Set up the fixed layout elements
+  clearLCDBuffer();
+  lcdPrint(0, 0, "L1:     L2:     ");
+  lcdPrint(0, 1, "L3:     A:      ");
+  updateSerialDisplay();
+}
+
+void updateDisplay(const String &tripMessage) {
+  // Check if we have a trip condition to display
+  if (tripMessage.length() > 0 || (lastTripMessage.length() > 0 && !loadState)) {
+    // Display trip information
+    String displayMessage = tripMessage.length() > 0 ? tripMessage : lastTripMessage;
+    
+    // Clear and format the first line with proper spacing
+    lcdPrint(0, 0, "TRIP: " + displayMessage);
+    
+    // Format trip count properly
+    String countText = String(tripCount);
+    lcdPrint(0, 1, "Retry: " + countText + "/" + String(MAX_TRIP_COUNT));
+    
+    lcdBufferChanged = true;
+  } else {
+    // No trip condition, display normal current readings
+    // First reset the LCD layout if we were previously showing a trip
+    static bool wasTripped = false;
+    if (wasTripped) {
+      initLCDLayout();  // Reset to standard layout
+      wasTripped = false;
+    }
+    
+    // Update current readings display
+    updateCurrentDisplay();
+    
+    // Track that we're not in trip state
+    wasTripped = false;
+  }
+}
+
+// Modified to ensure proper transition from trip display back to normal
+void updateCurrentDisplay() {
+  // Store previous values to only update when changed
+  static float prevCurrents[3] = {-1, -1, -1};
+  static float prevAvg = -1;
+  static bool prevState = !loadState;
+  bool valuesChanged = false;
+  
+  // Make sure the base layout is correct
+  if (lcdBuffer[0][0] != 'L' || lcdBuffer[0][2] != ':') {
+    initLCDLayout();
+  }
+  
+  // Update L1 current if changed significantly
+  if (abs(prevCurrents[0] - currents[0]) > 0.1) {
+    String val = String(currents[0], 1);
+    if (val.length() < 4) val += " "; // Ensure consistent spacing
+    lcdPrint(3, 0, val);
+    prevCurrents[0] = currents[0];
+    valuesChanged = true;
+  }
+  
+  // Update L2 current if changed significantly
+  if (abs(prevCurrents[1] - currents[1]) > 0.1) {
+    String val = String(currents[1], 1);
+    if (val.length() < 4) val += " "; // Ensure consistent spacing
+    lcdPrint(11, 0, val);
+    prevCurrents[1] = currents[1];
+    valuesChanged = true;
+  }
+  
+  // Update L3 current if changed significantly
+  if (abs(prevCurrents[2] - currents[2]) > 0.1) {
+    String val = String(currents[2], 1);
+    if (val.length() < 4) val += " "; // Ensure consistent spacing
+    lcdPrint(3, 1, val);
+    prevCurrents[2] = currents[2];
+    valuesChanged = true;
+  }
+  
+  // Update average current if changed significantly
+  if (abs(prevAvg - avgCurrent) > 0.1) {
+    String val = String(avgCurrent, 1);
+    if (val.length() < 4) val += " "; // Ensure consistent spacing
+    lcdPrint(10, 1, val);
+    prevAvg = avgCurrent;
+    valuesChanged = true;
+  }
+  
+  // Update load status if changed
+  if (prevState != loadState) {
+    lcdPrint(14, 1, loadState ? "ON" : "OFF");
+    prevState = loadState;
+    valuesChanged = true;
+  }
+  
+  // Update serial log if values changed significantly
+  if (valuesChanged) {
+    Serial.print("\nCurrent readings - L1: ");
+    Serial.print(currents[0], 2);
+    Serial.print("A, L2: ");
+    Serial.print(currents[1], 2);
+    Serial.print("A, L3: ");
+    Serial.print(currents[2], 2);
+    Serial.print("A, Avg: ");
+    Serial.print(avgCurrent, 2);
+    Serial.print("A, Load: ");
+    Serial.println(loadState ? "ON" : "OFF");
+  }
+}
+/*void updateDisplay(const String &tripMessage) {
+  if (tripMessage.length() > 0 || lastTripMessage.length() > 0 && !loadState) {
+    // Display trip information
+    static String prevMessage = "";
+    String displayMessage = tripMessage.length() > 0 ? tripMessage : lastTripMessage;
+    
+    // Only redraw if message changed
+    if (prevMessage != displayMessage) {
+      clearLCDBuffer();
+      lcdPrint(0, 0, "TRIP: " + displayMessage);
+      prevMessage = displayMessage;
+    }
+    
+    // Format trip count with proper spacing
+    String countText = String(tripCount);
+    while (countText.length() < 3) {
+      countText = " " + countText;
+    }
+    
+    // Always update the retry count
+    lcdPrint(0, 1, "Retry:" + countText + "/" + String(MAX_TRIP_COUNT));
+    lcdBufferChanged = true;
+    
+  } else {
+    // Display current readings
+    updateCurrentDisplay();
+  }
+}
+
+void updateCurrentDisplay() {
+  // Store previous values to only update when changed
+  static float prevCurrents[3] = {-1, -1, -1};
+  static float prevAvg = -1;
+  static bool prevState = !loadState;
+  bool valuesChanged = false;
+  
+  // Update L1 current if changed significantly
+  if (abs(prevCurrents[0] - currents[0]) > 0.1) {
+    String val = String(currents[0], 1);
+    if (val.length() < 4) val += " "; // Ensure consistent spacing
+    lcdPrint(3, 0, val);
+    prevCurrents[0] = currents[0];
+    valuesChanged = true;
+  }
+  
+  // Update L2 current if changed significantly
+  if (abs(prevCurrents[1] - currents[1]) > 0.1) {
+    String val = String(currents[1], 1);
+    if (val.length() < 4) val += " "; // Ensure consistent spacing
+    lcdPrint(11, 0, val);
+    prevCurrents[1] = currents[1];
+    valuesChanged = true;
+  }
+  
+  // Update L3 current if changed significantly
+  if (abs(prevCurrents[2] - currents[2]) > 0.1) {
+    String val = String(currents[2], 1);
+    if (val.length() < 4) val += " "; // Ensure consistent spacing
+    lcdPrint(3, 1, val);
+    prevCurrents[2] = currents[2];
+    valuesChanged = true;
+  }
+  
+  // Update average current if changed significantly
+  if (abs(prevAvg - avgCurrent) > 0.1) {
+    String val = String(avgCurrent, 1);
+    if (val.length() < 4) val += " "; // Ensure consistent spacing
+    lcdPrint(10, 1, val);
+    prevAvg = avgCurrent;
+    valuesChanged = true;
+  }
+  
+  // Update load status if changed
+  if (prevState != loadState) {
+    lcdPrint(14, 1, loadState ? "ON" : "OFF");
+    prevState = loadState;
+    valuesChanged = true;
+  }
+  
+  // Log to serial periodically
+  static unsigned long lastSerialUpdate = 0;
+  if (valuesChanged || millis() - lastSerialUpdate > 5000) { // 5 second minimum update
+    Serial.print("\nCurrent readings - L1: ");
+    Serial.print(currents[0], 2);
+    Serial.print("A, L2: ");
+    Serial.print(currents[1], 2);
+    Serial.print("A, L3: ");
+    Serial.print(currents[2], 2);
+    Serial.print("A, Avg: ");
+    Serial.print(avgCurrent, 2);
+    Serial.print("A, Load: ");
+    Serial.println(loadState ? "ON" : "OFF");
+    
+    lastSerialUpdate = millis();
+  }
+} */

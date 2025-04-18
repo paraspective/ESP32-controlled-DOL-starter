@@ -1,0 +1,1112 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+#include <EEPROM.h>  // Added for fault logging (Enhanced Option)
+
+// Memory Optimization (Option 10)
+#if defined(CONFIG_SPIRAM_SUPPORT)
+  #define USE_PSRAM
+#endif
+
+// Hardware Configuration
+#define L1_PIN 34     // ADC1_CH6
+#define L2_PIN 35     // ADC1_CH7
+#define L3_PIN 36     // ADC1_CH0
+#define STAR_PIN 4    // Relay control for STAR mode
+#define DELTA_PIN 5   // Relay control for DELTA mode
+#define ALARM_PIN 2   // Added output for alarm (Enhanced Option)
+#define RESET_BTN 15  // External reset button (Enhanced Option)
+
+// LCD Configuration (change based on your display size)
+#define LCD_COLS 20
+#define LCD_ROWS 4
+LiquidCrystal_I2C lcd(0x27, LCD_COLS, LCD_ROWS); // Adjust I2C address if needed
+
+// System Constants
+#define CALIBRATION_SAMPLES 1000  // Number of samples for calibration
+#define NOISE_THRESHOLD_FACTOR 1.5 // Multiplier for noise threshold
+#define IMBALANCE_THRESHOLD 1.0   // Current imbalance threshold in Amps
+#define INRUSH_THRESHOLD 5.0      // Inrush current threshold in Amps
+#define INRUSH_TIMEOUT 5000       // Time to wait before switching to DELTA (ms)
+#define RECALIBRATION_ATTEMPTS 5  // Max recalibration attempts on fault
+
+// Enhanced Safety Features (Option 5)
+#define MAX_CURRENT_THRESHOLD 15.0  // Maximum allowed current
+#define MIN_VOLTAGE 200.0           // Minimum voltage for phase loss detection
+#define CONSECUTIVE_SAMPLES_FOR_FAULT 5  // Require multiple consecutive fault readings
+#define FAULT_LOCKOUT_TIME 60000    // Time to wait before auto-reset (ms)
+
+// ACS712 Sensor Constants (change based on your sensor model)
+#define ACS712_SENSITIVITY 0.1   // 100mV/A for 10A model, 66mV/A for 30A model
+#define VCC 3.3                  // ESP32 ADC reference voltage
+#define ADC_RESOLUTION 4095.0    // ESP32 ADC resolution (12-bit)
+
+// Enhanced Filtering (Option 1)
+#define FILTER_SAMPLES 10        // Number of samples for moving average filter
+
+// EEPROM addresses for fault logging (Enhanced Option)
+#define EEPROM_FAULT_COUNT_ADDR 0
+#define EEPROM_FAULT_LOG_START 4
+#define MAX_FAULT_LOGS 10
+
+// System Variables
+float noiseThreshold[3] = {0, 0, 0}; // Noise thresholds for L1, L2, L3
+float baseline[3] = {0, 0, 0};      // Baseline values for L1, L2, L3
+float currents[3] = {0, 0, 0};      // Current readings for L1, L2, L3
+float currentReadings[3][FILTER_SAMPLES]; // Filter buffer for current readings
+int readIndex = 0;                 // Current position in the filter buffer
+
+// Energy Monitoring Variables (Option 9)
+float totalEnergy[3] = {0, 0, 0};  // Energy in Wh
+unsigned long lastEnergyCalc = 0;
+float systemVoltage = 230.0;       // Assumed voltage for calculations
+float powerFactor = 0.85;          // Assumed power factor
+
+// Peak demand monitoring (Enhanced Option)
+float peakDemand = 0.0;           // Peak power demand
+float currentDemand = 0.0;        // Current power demand
+unsigned long demandWindow = 900000; // 15-minute demand window (ms)
+unsigned long lastDemandReset = 0;
+
+enum CircuitMode {STAR, DELTA};
+enum SystemStatus {NORMAL, INRUSH, FAULT};
+
+// Enhanced Error Handling and System Diagnostics (Option 8)
+enum DiagnosticCode {
+  DIAG_OK = 0,
+  DIAG_SENSOR_L1_FAIL = 1,
+  DIAG_SENSOR_L2_FAIL = 2,
+  DIAG_SENSOR_L3_FAIL = 3,
+  DIAG_ADC_FAIL = 4,
+  DIAG_LCD_FAIL = 5,
+  DIAG_RELAY_FAULT = 6,
+  DIAG_EEPROM_FAIL = 7  // Added (Enhanced Option)
+};
+
+CircuitMode currentMode = STAR;
+SystemStatus systemStatus = NORMAL;
+DiagnosticCode systemDiagnostic = DIAG_OK;
+
+unsigned long inrushStartTime = 0;
+bool inInrushState = false;
+bool systemTripped = false;
+
+// Enhanced Safety Variables (Option 5)
+int consecutiveFaultSamples = 0;
+unsigned long faultLockoutStart = 0;
+bool inLockout = false;
+
+// Fault type enum for detailed logging (Enhanced Option)
+enum FaultType {
+  FAULT_NONE = 0,
+  FAULT_OVERCURRENT_L1 = 1,
+  FAULT_OVERCURRENT_L2 = 2,
+  FAULT_OVERCURRENT_L3 = 3,
+  FAULT_PHASE_IMBALANCE = 4,
+  FAULT_PHASE_LOSS = 5,
+  FAULT_RELAY_FAILURE = 6,
+  FAULT_SENSOR_FAILURE = 7
+};
+
+FaultType lastFaultType = FAULT_NONE;
+
+// Function prototypes
+void calibrateSystem();
+void readCurrents();
+void readCurrentsRMS();
+void detectFaults();
+void updateDisplay();
+void controlRelays();
+void tripSystem(String faultMessage, FaultType faultType);
+void recoverSystem();
+void runDiagnostics();
+void calculateEnergy();
+void logFault(FaultType faultType);  // Added (Enhanced Option)
+void checkDemand();                  // Added (Enhanced Option)
+void checkUserReset();               // Added (Enhanced Option)
+
+void setup() {
+  // Initialize serial with optimized settings (Option 10)
+  #ifdef USE_PSRAM
+    Serial.begin(115200, SERIAL_8N1, -1, -1, true);  // Use PSRAM for serial buffer
+  #else
+    Serial.begin(115200);
+  #endif
+  
+  // Initialize EEPROM (Enhanced Option)
+  EEPROM.begin(512);
+  
+  // Set ADC resolution and attenuation for better accuracy (Option 10)
+  analogReadResolution(12);  // 12-bit resolution
+  analogSetAttenuation(ADC_11db);  // Input attenuation for better range
+  
+  // Set CPU clock to maximum for performance (Option 10)
+  setCpuFrequencyMhz(240);
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Starting...");
+  
+  // Initialize relay and additional control pins
+  pinMode(STAR_PIN, OUTPUT);
+  pinMode(DELTA_PIN, OUTPUT);
+  pinMode(ALARM_PIN, OUTPUT);  // Added (Enhanced Option)
+  pinMode(RESET_BTN, INPUT_PULLUP);  // Added (Enhanced Option)
+  
+  // Set default relay state (STAR mode)
+  digitalWrite(STAR_PIN, HIGH);
+  digitalWrite(DELTA_PIN, LOW);
+  digitalWrite(ALARM_PIN, LOW);  // Ensure alarm is off at startup
+  
+  // Initialize filter buffers (Option 1)
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < FILTER_SAMPLES; j++) {
+      currentReadings[i][j] = 0.0;
+    }
+  }
+  
+  // Initialize energy calculation (Option 9)
+  lastEnergyCalc = millis();
+  lastDemandReset = millis();
+  
+  // Run initial diagnostics (Option 8)
+  runDiagnostics();
+  
+  // Start calibration
+  calibrateSystem();
+  
+  // System ready
+  lcd.clear();
+  lcd.print("System Ready");
+  delay(1000);
+}
+
+void loop() {
+  static unsigned long lastUpdate = 0;
+  const unsigned long updateInterval = 500; // Update display every 500ms
+  
+  // Read current values with enhanced RMS method (Option 2)
+  readCurrentsRMS();
+  
+  // Calculate energy consumption (Option 9)
+  calculateEnergy();
+  
+  // Check demand (Enhanced Option)
+  checkDemand();
+  
+  // Detect faults and system status
+  detectFaults();
+  
+  // Control relays based on system state
+  controlRelays();
+  
+  // Check for user reset button press (Enhanced Option)
+  checkUserReset();
+  
+  // Update display at regular intervals
+  if (millis() - lastUpdate >= updateInterval) {
+    updateDisplay();
+    lastUpdate = millis();
+    
+    // Debug output to serial
+    Serial.printf("L1: %.2fA, L2: %.2fA, L3: %.2fA | Mode: %s | Status: %s | Diag: %d | Energy: %.1fWh | Demand: %.1fW\n",
+                 currents[0], currents[1], currents[2],
+                 (currentMode == STAR) ? "STAR" : "DELTA",
+                 (systemStatus == NORMAL) ? "NORMAL" : 
+                 (systemStatus == INRUSH) ? "INRUSH" : "FAULT",
+                 systemDiagnostic,
+                 totalEnergy[0] + totalEnergy[1] + totalEnergy[2],
+                 currentDemand);
+  }
+  
+  // Small delay to prevent watchdog timer issues
+  delay(10);
+}
+
+void calibrateSystem() {
+  lcd.clear();
+  lcd.print("Calibrating...");
+  lcd.setCursor(0, 1);
+  lcd.print("0%");
+  
+  // Variables to store min/max values during calibration
+  float minValues[3] = {4095, 4095, 4095};
+  float maxValues[3] = {0, 0, 0};
+  
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    // Read raw ADC values
+    int l1Raw = analogRead(L1_PIN);
+    int l2Raw = analogRead(L2_PIN);
+    int l3Raw = analogRead(L3_PIN);
+    
+    // Update min/max values
+    if (l1Raw < minValues[0]) minValues[0] = l1Raw;
+    if (l1Raw > maxValues[0]) maxValues[0] = l1Raw;
+    if (l2Raw < minValues[1]) minValues[1] = l2Raw;
+    if (l2Raw > maxValues[1]) maxValues[1] = l2Raw;
+    if (l3Raw < minValues[2]) minValues[2] = l3Raw;
+    if (l3Raw > maxValues[2]) maxValues[2] = l3Raw;
+    
+    // Update progress on LCD
+    if (i % (CALIBRATION_SAMPLES / 10) == 0) {
+      int progress = (i * 100) / CALIBRATION_SAMPLES;
+      lcd.setCursor(0, 1);
+      lcd.print(progress);
+      lcd.print("%  ");
+    }
+    
+    delay(5); // Small delay between samples
+  }
+  
+  // Calculate baseline (midpoint) and noise threshold
+  for (int i = 0; i < 3; i++) {
+    baseline[i] = (minValues[i] + maxValues[i]) / 2.0;
+    noiseThreshold[i] = (maxValues[i] - minValues[i]) / 2.0 * NOISE_THRESHOLD_FACTOR;
+    
+    // Diagnostic check - flag potential sensor issues (Option 8)
+    if (maxValues[i] - minValues[i] < 10) {
+      systemDiagnostic = (DiagnosticCode)(DIAG_SENSOR_L1_FAIL + i);
+    }
+  }
+  
+  lcd.clear();
+  lcd.print("Calibration Done");
+  lcd.setCursor(0, 1);
+  lcd.print("Noise Th: ");
+  lcd.print(noiseThreshold[0], 1);
+  delay(1000);
+}
+
+// Original current reading function (kept for reference)
+void readCurrents() {
+  // Read raw ADC values
+  int l1Raw = analogRead(L1_PIN);
+  int l2Raw = analogRead(L2_PIN);
+  int l3Raw = analogRead(L3_PIN);
+  
+  // Convert to voltage
+  float l1Voltage = (l1Raw / ADC_RESOLUTION) * VCC;
+  float l2Voltage = (l2Raw / ADC_RESOLUTION) * VCC;
+  float l3Voltage = (l3Raw / ADC_RESOLUTION) * VCC;
+  
+  // Convert to current (ACS712 formula)
+  float newCurrents[3];
+  newCurrents[0] = (l1Voltage - (VCC / 2.0)) / ACS712_SENSITIVITY;
+  newCurrents[1] = (l2Voltage - (VCC / 2.0)) / ACS712_SENSITIVITY;
+  newCurrents[2] = (l3Voltage - (VCC / 2.0)) / ACS712_SENSITIVITY;
+  
+  // Add readings to moving average array (Option 1)
+  for (int i = 0; i < 3; i++) {
+    currentReadings[i][readIndex] = newCurrents[i];
+  }
+  readIndex = (readIndex + 1) % FILTER_SAMPLES;
+  
+  // Calculate moving average (Option 1)
+  for (int i = 0; i < 3; i++) {
+    float sum = 0;
+    for (int j = 0; j < FILTER_SAMPLES; j++) {
+      sum += currentReadings[i][j];
+    }
+    currents[i] = sum / FILTER_SAMPLES;
+    
+    // Apply noise filtering
+    if (fabs(currents[i]) < noiseThreshold[i]) {
+      currents[i] = 0.0;
+    }
+  }
+}
+
+// Enhanced RMS current reading (Option 2)
+void readCurrentsRMS() {
+  // Number of samples for RMS calculation
+  const int numSamples = 100;
+  float sumSquared[3] = {0, 0, 0};
+  
+  // Take multiple samples for RMS calculation
+  for (int i = 0; i < numSamples; i++) {
+    int l1Raw = analogRead(L1_PIN);
+    int l2Raw = analogRead(L2_PIN);
+    int l3Raw = analogRead(L3_PIN);
+    
+    // Convert to voltage
+    float l1Voltage = (l1Raw / ADC_RESOLUTION) * VCC;
+    float l2Voltage = (l2Raw / ADC_RESOLUTION) * VCC;
+    float l3Voltage = (l3Raw / ADC_RESOLUTION) * VCC;
+    
+    // Convert to current (ACS712 formula)
+    float instantCurrent[3];
+    instantCurrent[0] = (l1Voltage - (VCC / 2.0)) / ACS712_SENSITIVITY;
+    instantCurrent[1] = (l2Voltage - (VCC / 2.0)) / ACS712_SENSITIVITY;
+    instantCurrent[2] = (l3Voltage - (VCC / 2.0)) / ACS712_SENSITIVITY;
+    
+    // Square and sum for RMS calculation
+    for (int j = 0; j < 3; j++) {
+      sumSquared[j] += instantCurrent[j] * instantCurrent[j];
+    }
+    
+    delayMicroseconds(200); // Sample at roughly 5kHz
+  }
+  
+  // Calculate RMS values
+  for (int i = 0; i < 3; i++) {
+    float rmsValue = sqrt(sumSquared[i] / numSamples);
+    
+    // Add to moving average filter (Option 1)
+    currentReadings[i][readIndex] = rmsValue;
+    
+    // Apply noise filtering
+    if (rmsValue < noiseThreshold[i]) {
+      rmsValue = 0.0;
+    }
+  }
+  
+  // Update read index for filter
+  readIndex = (readIndex + 1) % FILTER_SAMPLES;
+  
+  // Calculate filtered values
+  for (int i = 0; i < 3; i++) {
+    float sum = 0;
+    for (int j = 0; j < FILTER_SAMPLES; j++) {
+      sum += currentReadings[i][j];
+    }
+    currents[i] = sum / FILTER_SAMPLES;
+  }
+}
+
+// Enhanced fault detection with more detailed fault types (Enhanced Option)
+void detectFaults() {
+  bool faultDetected = false;
+  FaultType potentialFault = FAULT_NONE;
+  
+  // Skip fault detection if we're already in fault or lockout state
+  if (systemTripped || inLockout) {
+    return;
+  }
+  
+  // Check for overcurrent
+  for (int i = 0; i < 3; i++) {
+    if (currents[i] > MAX_CURRENT_THRESHOLD) {
+      faultDetected = true;
+      potentialFault = (FaultType)(FAULT_OVERCURRENT_L1 + i);
+      if (consecutiveFaultSamples >= CONSECUTIVE_SAMPLES_FOR_FAULT) {
+        tripSystem("OVERCURRENT L" + String(i+1), potentialFault);
+        return;
+      }
+    }
+  }
+  
+  // Check for inrush current
+  bool inrushDetected = false;
+  for (int i = 0; i < 3; i++) {
+    if (currents[i] >= INRUSH_THRESHOLD && currents[i] < MAX_CURRENT_THRESHOLD) {
+      inrushDetected = true;
+      break;
+    }
+  }
+  
+  if (inrushDetected) {
+    if (!inInrushState) {
+      inInrushState = true;
+      inrushStartTime = millis();
+    }
+    systemStatus = INRUSH;
+  } else if (systemStatus == INRUSH && !inrushDetected) {
+    // Only transition from INRUSH to NORMAL when currents fall below threshold
+    systemStatus = NORMAL;
+    inInrushState = false;
+  }
+  
+  // Check for phase imbalance
+  float maxDiff = 0;
+  float diff12 = fabs(currents[0] - currents[1]);
+  float diff23 = fabs(currents[1] - currents[2]);
+  float diff31 = fabs(currents[2] - currents[0]);
+  
+  maxDiff = max(diff12, max(diff23, diff31));
+  
+  // Only check imbalance when significant current is flowing (at least 10% of max)
+  float avgCurrent = (currents[0] + currents[1] + currents[2]) / 3.0;
+  if (maxDiff > IMBALANCE_THRESHOLD && systemStatus != INRUSH && avgCurrent > (MAX_CURRENT_THRESHOLD * 0.1)) {
+    faultDetected = true;
+    potentialFault = FAULT_PHASE_IMBALANCE;
+    if (consecutiveFaultSamples >= CONSECUTIVE_SAMPLES_FOR_FAULT) {
+      tripSystem("PHASE IMBALANCE", potentialFault);
+      return;
+    }
+  }
+  
+  // Check for phase loss (current near zero on one phase while others have significant current)
+  int zeroPhases = 0;
+  int nonZeroPhases = 0;
+  float avgNonZeroCurrent = 0;
+  
+  for (int i = 0; i < 3; i++) {
+    if (currents[i] < noiseThreshold[i]) {
+      zeroPhases++;
+    } else {
+      nonZeroPhases++;
+      avgNonZeroCurrent += currents[i];
+    }
+  }
+  
+  if (nonZeroPhases > 0) {
+    avgNonZeroCurrent /= nonZeroPhases;
+  }
+  
+  if (zeroPhases == 1 && nonZeroPhases == 2 && avgNonZeroCurrent > IMBALANCE_THRESHOLD) {
+    faultDetected = true;
+    potentialFault = FAULT_PHASE_LOSS;
+    if (consecutiveFaultSamples >= CONSECUTIVE_SAMPLES_FOR_FAULT) {
+      tripSystem("PHASE LOSS", potentialFault);
+      return;
+    }
+  }
+  
+  // Enhanced fault counting logic
+  if (faultDetected) {
+    consecutiveFaultSamples++;
+  } else {
+    consecutiveFaultSamples = 0;
+  }
+  
+  // Check if we're in a lockout period after multiple faults
+  if (inLockout) {
+    if (millis() - faultLockoutStart >= FAULT_LOCKOUT_TIME) {
+      inLockout = false;
+      Serial.println("Lockout period expired, system reset enabled");
+    } else {
+      // Still in lockout period
+      return;
+    }
+  }
+  
+  // If we've had repeated faults in a short time, enter lockout
+  static int faultCounter = 0;
+  static unsigned long lastFaultTime = 0;
+  
+  if (faultDetected && potentialFault != FAULT_NONE) {
+    if (millis() - lastFaultTime < 60000) {
+      faultCounter++;
+      if (faultCounter >= 3) {
+        faultLockoutStart = millis();
+        inLockout = true;
+        digitalWrite(ALARM_PIN, HIGH);  // Activate alarm on lockout
+        lcd.clear();
+        lcd.print("MULTIPLE FAULTS");
+        lcd.setCursor(0, 1);
+        lcd.print("LOCKOUT: 60s");
+        
+        // Log the lockout event
+        logFault(potentialFault);
+        return;
+      }
+    } else {
+      // Reset counter if last fault was more than a minute ago
+      faultCounter = 1;
+    }
+    lastFaultTime = millis();
+  }
+}
+
+void updateDisplay() {
+  lcd.clear();
+  
+  // Line 1: Current readings
+  lcd.setCursor(0, 0);
+  lcd.print("L1:");
+  lcd.print(currents[0], 2);
+  lcd.print("A");
+  
+  lcd.setCursor(LCD_COLS/3, 0);
+  lcd.print("L2:");
+  lcd.print(currents[1], 2);
+  lcd.print("A");
+  
+  lcd.setCursor(2*LCD_COLS/3, 0);
+  lcd.print("L3:");
+  lcd.print(currents[2], 2);
+  lcd.print("A");
+  
+  // Line 2: Mode and Status
+  lcd.setCursor(0, 1);
+  lcd.print("Mode:");
+  lcd.print((currentMode == STAR) ? "STAR" : "DELTA");
+  
+  lcd.setCursor(LCD_COLS/2, 1);
+  lcd.print("Status:");
+  lcd.print((systemStatus == NORMAL) ? "NORMAL" : 
+            (systemStatus == INRUSH) ? "INRUSH" : "FAULT");
+  
+  // Additional lines for larger displays
+  if (LCD_ROWS > 2) {
+    // Line 3: Additional info or blank
+    lcd.setCursor(0, 2);
+    if (systemTripped) {
+      lcd.print("TRIPPED - Check Fault");
+    } else if (systemStatus == INRUSH) {
+      unsigned long elapsed = (millis() - inrushStartTime) / 1000;
+      lcd.print("INRUSH Time: ");
+      lcd.print(elapsed);
+      lcd.print("s");
+    } else {
+      // Display energy consumption (Option 9)
+      float totalWh = totalEnergy[0] + totalEnergy[1] + totalEnergy[2];
+      lcd.print("Energy: ");
+      if (totalWh < 1000) {
+        lcd.print(totalWh, 1);
+        lcd.print("Wh");
+      } else {
+        lcd.print(totalWh/1000, 2);
+        lcd.print("kWh");
+      }
+    }
+    
+    // Line 4: For larger displays
+    if (LCD_ROWS > 3) {
+      lcd.setCursor(0, 3);
+      
+      // Display diagnostic status when relevant (Option 8)
+      if (systemDiagnostic != DIAG_OK) {
+        lcd.print("DIAG: ERR");
+        lcd.print(systemDiagnostic);
+      } else if (peakDemand > 0.0) {
+        lcd.print("Peak: ");
+        lcd.print(peakDemand, 1);
+        lcd.print("W ");
+        lcd.print(currentDemand, 1);
+        lcd.print("W");
+      } else {
+        lcd.print("Max Diff: ");
+        lcd.print(max(fabs(currents[0] - currents[1]), 
+                     max(fabs(currents[1] - currents[2]), 
+                         fabs(currents[2] - currents[0]))), 2);
+        lcd.print("A");
+      }
+    }
+  }
+}
+
+// Enhanced relay control function with detailed status handling (Enhanced Option)
+void controlRelays() {
+  if (systemTripped) return;
+  
+  // Handle automatic switching from STAR to DELTA after inrush
+  if (systemStatus == INRUSH && currentMode == STAR) {
+    unsigned long inrushElapsed = millis() - inrushStartTime;
+    
+    // Show countdown to switching during inrush
+    if (inrushElapsed % 1000 < 20) {  // Display countdown once per second
+      Serial.printf("Inrush countdown: %.1fs remaining\n", 
+                   (INRUSH_TIMEOUT - inrushElapsed) / 1000.0);
+    }
+    
+    if (inrushElapsed >= INRUSH_TIMEOUT) {
+      // Enhanced relay control with error checking (Option 8)
+      bool relaySuccess = true;
+      
+      // Update display to indicate switching
+      lcd.clear();
+      lcd.print("Switching to DELTA");
+      
+      digitalWrite(STAR_PIN, LOW);
+      delay(100); // Small delay to ensure relays don't switch simultaneously
+      
+      digitalWrite(DELTA_PIN, HIGH);
+      delay(100);
+      
+      // Basic validation check - could be enhanced with feedback pins
+      if (digitalRead(STAR_PIN) != LOW || digitalRead(DELTA_PIN) != HIGH) {
+        relaySuccess = false;
+        systemDiagnostic = DIAG_RELAY_FAULT;
+        
+        // Try again once
+        digitalWrite(STAR_PIN, LOW);
+        delay(100);
+        digitalWrite(DELTA_PIN, HIGH);
+        delay(100);
+        
+        // Check again
+        if (digitalRead(STAR_PIN) != LOW || digitalRead(DELTA_PIN) != HIGH) {
+          tripSystem("RELAY FAILURE", FAULT_RELAY_FAILURE);
+          return;
+        }
+      }
+      
+      if (relaySuccess) {
+        currentMode = DELTA;
+        inInrushState = false;
+        Serial.println("Switched from STAR to DELTA mode successfully");
+        
+        // Brief confirmation display
+        lcd.clear();
+        lcd.print("Now in DELTA mode");
+        delay(1000);
+      } else {
+        Serial.println("ERROR: Failed to switch from STAR to DELTA mode");
+      }
+    }
+  }
+  
+  // Enhanced automatic restart after inrush phase (Enhanced Option)
+  // If motors are off for a certain period (all currents near zero), reset to STAR mode for next start
+  static unsigned long lastSignificantCurrent = 0;
+  float sumCurrents = currents[0] + currents[1] + currents[2];
+  
+  if (sumCurrents > IMBALANCE_THRESHOLD) {
+    lastSignificantCurrent = millis();
+  } else if (currentMode == DELTA && (millis() - lastSignificantCurrent > 10000)) {
+    // After 10 seconds of no significant current in DELTA mode, prepare for next start by switching to STAR
+    digitalWrite(DELTA_PIN, LOW);
+    delay(100);
+    digitalWrite(STAR_PIN, HIGH);
+    currentMode = STAR;
+    
+    Serial.println("Motor appears stopped, reset to STAR mode for next start");
+    
+    // Reset inrush timer as well
+    inInrushState = false;
+    
+    // Update display
+    lcd.clear();
+    lcd.print("Motors Off");
+    lcd.setCursor(0, 1);
+    lcd.print("Reset to STAR mode");
+  }
+}
+
+// Enhanced tripSystem function with detailed logging (Enhanced Option)
+void tripSystem(String faultMessage, FaultType faultType) {
+  systemTripped = true;
+  systemStatus = FAULT;
+  lastFaultType = faultType;
+  
+  // Turn off all relays
+  digitalWrite(STAR_PIN, LOW);
+  digitalWrite(DELTA_PIN, LOW);
+  
+  // Activate alarm
+  digitalWrite(ALARM_PIN, HIGH);
+  
+  // Log the fault
+  logFault(faultType);
+  
+  // Update display with fault message
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("FAULT: ");
+  lcd.print(faultMessage);
+  lcd.setCursor(0, 1);
+  lcd.print("Tripped - Recalibrating");
+  
+  // Log the fault with timestamp and detailed info
+  Serial.printf("FAULT DETECTED! Type: %s (%d), Time: %lu, Currents: L1=%.2fA, L2=%.2fA, L3=%.2fA\n", 
+               faultMessage.c_str(), faultType, millis(), currents[0], currents[1], currents[2]);
+  
+  // Store peak fault current values for later analysis
+  float peakFaultCurrents[3];
+  memcpy(peakFaultCurrents, currents, sizeof(currents));
+  
+  // Attempt recalibration
+  bool recalibrated = false;
+  for (int attempt = 1; attempt <= RECALIBRATION_ATTEMPTS; attempt++) {
+    delay(1000);
+    calibrateSystem();
+    
+    // Verify calibration
+    readCurrentsRMS(); // Use enhanced RMS reading
+    bool faultStillPresent = false;
+    for (int i = 0; i < 3; i++) {
+      if (currents[i] >= INRUSH_THRESHOLD || isnan(currents[i])) {
+        faultStillPresent = true;
+        break;
+      }
+    }
+    
+    if (!faultStillPresent) {
+      recalibrated = true;
+      break;
+    }
+    
+    lcd.setCursor(0, 2);
+    lcd.print("Attempt ");
+    lcd.print(attempt);
+    lcd.print("/");
+    lcd.print(RECALIBRATION_ATTEMPTS);
+    
+    Serial.printf("Recalibration attempt %d/%d failed\n", attempt, RECALIBRATION_ATTEMPTS);
+  }
+  
+  if (recalibrated) {
+    Serial.println("System successfully recalibrated after fault");
+    recoverSystem();
+  } else {
+    // Enhanced error handling (Option 8)
+    systemDiagnostic = DIAG_SENSOR_L1_FAIL; // Generic failure code
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Calibration Failed");
+    lcd.setCursor(0, 1);
+    lcd.print("System Halted");
+    lcd.setCursor(0, 2);
+    lcd.print("Diag Code: ");
+    lcd.print(systemDiagnostic);
+    lcd.setCursor(0, 3);
+    lcd.print("MANUAL RESET REQD");
+    
+    Serial.println("CRITICAL: System halted after multiple calibration failures");
+    
+    // In a production environment, you might want to try hardware reset or
+    // implement a watchdog timer reset here instead of infinite loop
+    while(true) {
+      delay(1000);
+      // Check for manual reset
+      if (digitalRead(RESET_BTN) == LOW) {
+        delay(50); // Debounce
+        if (digitalRead(RESET_BTN) == LOW) {
+          Serial.println("Manual reset detected, restarting system");
+          ESP.restart(); // Hardware reset
+        }
+      }
+      // Blink LED or provide other indicator of failure state
+      digitalWrite(ALARM_PIN, !digitalRead(ALARM_PIN)); // Toggle alarm
+    }
+  }
+}
+
+void recoverSystem() {
+  systemTripped = false;
+  systemStatus = NORMAL;
+  inInrushState = false;
+  currentMode = STAR;
+  consecutiveFaultSamples = 0;
+  
+  // Turn off alarm
+  digitalWrite(ALARM_PIN, LOW);
+  
+  // Reset relays to default state
+  digitalWrite(STAR_PIN, HIGH);
+  digitalWrite(DELTA_PIN, LOW);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Recovered");
+  lcd.setCursor(0, 1);
+  lcd.print("Resuming Operation");
+  delay(2000);
+}
+
+// System Diagnostics (Option 8)
+void runDiagnostics() {
+  lcd.clear();
+  lcd.print("Diagnostics...");
+  
+  // Check ADC readings
+  int l1Raw = analogRead(L1_PIN);
+  int l2Raw = analogRead(L2_PIN);
+  int l3Raw = analogRead(L3_PIN);
+  
+  // Check if sensors are connected (should not be max or min ADC value)
+  if (l1Raw == 0 || l1Raw >= 4095) systemDiagnostic = DIAG_SENSOR_L1_FAIL;
+  else if (l2Raw == 0 || l2Raw >= 4095) systemDiagnostic = DIAG_SENSOR_L2_FAIL;
+  else if (l3Raw == 0 || l3Raw >= 4095) systemDiagnostic = DIAG_SENSOR_L3_FAIL;
+  
+  // Check relay connections by toggling and reading feedback (if available)
+  digitalWrite(STAR_PIN, HIGH);
+  delay(50);
+  digitalWrite(STAR_PIN, LOW);
+  delay(50);
+  digitalWrite(DELTA_PIN, HIGH);
+  delay(50);
+  digitalWrite(DELTA_PIN, LOW);
+  
+  // Check EEPROM operation
+  uint8_t testValue = 123;
+  EEPROM.write(500, testValue); // Use a test address away from fault logs
+  EEPROM.commit();
+  if (EEPROM.read(500) != testValue) {
+    systemDiagnostic = DIAG_EEPROM_FAIL;
+  }
+  
+  // Test alarm
+  digitalWrite(ALARM_PIN, HIGH);
+  delay(200);
+  digitalWrite(ALARM_PIN, LOW);
+  
+  // Set default relay state back
+  digitalWrite(STAR_PIN, HIGH);
+  delay(50);
+  
+  // Report diagnostic results
+  lcd.setCursor(0, 1);
+  if (systemDiagnostic == DIAG_OK) {
+    lcd.print("All Systems OK");
+    Serial.println("Diagnostics: All systems operational");
+  } else {
+    lcd.print("ERROR CODE: ");
+    lcd.print(systemDiagnostic);
+    Serial.printf("Diagnostics: Error detected - code %d\n", systemDiagnostic);
+  }
+  delay(1000);
+}
+
+// Energy Monitoring (Option 9)
+void calculateEnergy() {
+  unsigned long now = millis();
+  float hourElapsed = (now - lastEnergyCalc) / 3600000.0;  // Convert ms to hours
+  
+  for (int i = 0; i < 3; i++) {
+    // Power = V * I * PF
+    float power = systemVoltage * currents[i] * powerFactor;
+    
+    // Energy = Power * Time
+    totalEnergy[i] += power * hourElapsed;
+  }
+  
+  lastEnergyCalc = now;
+}
+
+// Enhanced demand monitoring (Enhanced Option)
+void checkDemand() {
+  // Calculate total power demand across all phases
+  float totalPower = 0;
+  for (int i = 0; i < 3; i++) {
+    totalPower += systemVoltage * currents[i] * powerFactor;
+  }
+  
+  // Update current demand
+  currentDemand = totalPower;
+  
+  // Check if this is a new peak
+  if (currentDemand > peakDemand) {
+    peakDemand = currentDemand;
+    // Could log new peak to EEPROM if desired
+  }
+  
+  // Reset demand window every 15 minutes (typical utility demand window)
+  if (millis() - lastDemandReset > demandWindow) {
+    // Log the previous peak before resetting
+    Serial.printf("15-minute peak demand: %.1f W\n", peakDemand);
+    
+    // Reset for next window
+    lastDemandReset = millis();
+    peakDemand = currentDemand; // Start new window with current demand
+  }
+}
+
+// Enhanced fault logging to EEPROM (Enhanced Option)
+void logFault(FaultType faultType) {
+  if (faultType == FAULT_NONE) return;
+  
+  // Read current fault count
+  uint16_t faultCount = EEPROM.read(EEPROM_FAULT_COUNT_ADDR) | 
+                       (EEPROM.read(EEPROM_FAULT_COUNT_ADDR + 1) << 8);
+  
+  // Calculate address for this fault log
+  uint16_t logAddr = EEPROM_FAULT_LOG_START + 
+                   (faultCount % MAX_FAULT_LOGS) * 16; // 16 bytes per log entry
+  
+  // Structure of fault log entry:
+  // - Fault type (1 byte)
+  // - Runtime minutes (2 bytes)
+  // - Current readings (3 * 4 bytes = 12 bytes)
+  // - Checksum (1 byte)
+  
+  uint16_t runtimeMinutes = millis() / 60000;
+  
+  // Write fault data
+  EEPROM.write(logAddr, faultType);
+  EEPROM.write(logAddr + 1, runtimeMinutes & 0xFF);
+  EEPROM.write(logAddr + 2, (runtimeMinutes >> 8) & 0xFF);
+  
+  // Write current readings (converting float to bytes)
+  for (int i = 0; i < 3; i++) {
+    uint32_t currentInt = *(uint32_t*)&currents[i]; // Reinterpret as uint32_t
+    for (int j = 0; j < 4; j++) {
+      EEPROM.write(logAddr + 3 + (i * 4) + j, (currentInt >> (j * 8)) & 0xFF);
+    }
+  }
+  
+  // Calculate simple checksum
+  uint8_t checksum = faultType + (runtimeMinutes & 0xFF) + ((runtimeMinutes >> 8) & 0xFF);
+  for (int i = 0; i < 12; i++) {
+    checksum += EEPROM.read(logAddr + 3 + i);
+  }
+  EEPROM.write(logAddr + 15, checksum);
+  
+  // Update fault count
+  faultCount++;
+  EEPROM.write(EEPROM_FAULT_COUNT_ADDR, faultCount & 0xFF);
+  EEPROM.write(EEPROM_FAULT_COUNT_ADDR + 1, (faultCount >> 8) & 0xFF);
+  
+  // Commit the changes
+  EEPROM.commit();
+  
+  Serial.printf("Fault logged to EEPROM: Type %d, Runtime %d minutes, Log slot %d\n", 
+               faultType, runtimeMinutes, (faultCount - 1) % MAX_FAULT_LOGS);
+}
+
+// Check for manual reset button press (Enhanced Option)
+void checkUserReset() {
+  static unsigned long lastButtonCheck = 0;
+  static bool buttonPressed = false;
+  static unsigned long buttonPressTime = 0;
+  
+  // Debounce and check only every 50ms
+  if (millis() - lastButtonCheck < 50) return;
+  lastButtonCheck = millis();
+  
+  // Check button state
+  if (digitalRead(RESET_BTN) == LOW) {
+    if (!buttonPressed) {
+      buttonPressed = true;
+      buttonPressTime = millis();
+    } 
+    else if (millis() - buttonPressTime > 3000) {
+      // Button held for 3 seconds - perform reset
+      lcd.clear();
+      lcd.print("User Reset");
+      lcd.setCursor(0, 1);
+      lcd.print("Restarting...");
+      
+      Serial.println("Manual reset activated");
+      delay(1000);
+      
+      if (systemTripped) {
+        // Clear alarm and reset system
+        digitalWrite(ALARM_PIN, LOW);
+        recoverSystem();
+      } else {
+        // Full system restart
+        ESP.restart();
+      }
+    }
+  } else {
+    buttonPressed = false;
+  }
+}
+
+// Added function to display fault history from EEPROM (Enhanced Option)
+void displayFaultHistory() {
+  uint16_t faultCount = EEPROM.read(EEPROM_FAULT_COUNT_ADDR) | 
+                       (EEPROM.read(EEPROM_FAULT_COUNT_ADDR + 1) << 8);
+  
+  if (faultCount == 0) {
+    Serial.println("No fault history available");
+    return;
+  }
+  
+  Serial.printf("Fault History (last %d faults):\n", min(faultCount, (uint16_t)MAX_FAULT_LOGS));
+  
+  int entries = min(faultCount, (uint16_t)MAX_FAULT_LOGS);
+  int startIndex = (faultCount > MAX_FAULT_LOGS) ? (faultCount % MAX_FAULT_LOGS) : 0;
+  
+  for (int i = 0; i < entries; i++) {
+    int index = (startIndex + i) % MAX_FAULT_LOGS;
+    uint16_t logAddr = EEPROM_FAULT_LOG_START + index * 16;
+    
+    // Read fault data
+    uint8_t faultType = EEPROM.read(logAddr);
+    uint16_t runtimeMinutes = EEPROM.read(logAddr + 1) | (EEPROM.read(logAddr + 2) << 8);
+    
+    // Read currents (converting bytes back to float)
+    float storedCurrents[3];
+    for (int j = 0; j < 3; j++) {
+      uint32_t currentInt = 0;
+      for (int k = 0; k < 4; k++) {
+        currentInt |= ((uint32_t)EEPROM.read(logAddr + 3 + (j * 4) + k)) << (k * 8);
+      }
+      storedCurrents[j] = *(float*)&currentInt;
+    }
+    
+    // Calculate checksum to verify data integrity
+    uint8_t storedChecksum = EEPROM.read(logAddr + 15);
+    uint8_t calculatedChecksum = faultType + (runtimeMinutes & 0xFF) + ((runtimeMinutes >> 8) & 0xFF);
+    for (int j = 0; j < 12; j++) {
+      calculatedChecksum += EEPROM.read(logAddr + 3 + j);
+    }
+    
+    // Report fault details
+    Serial.printf("Fault #%d: Type %d, Runtime %d minutes, Currents: %.2fA, %.2fA, %.2fA", 
+                 faultCount - entries + i + 1, faultType, runtimeMinutes,
+                 storedCurrents[0], storedCurrents[1], storedCurrents[2]);
+    
+    if (calculatedChecksum != storedChecksum) {
+      Serial.print(" [DATA CORRUPTED]");
+    }
+    
+    Serial.println();
+  }
+}
+
+// Function to clear fault history (Enhanced Option)
+void clearFaultHistory() {
+  // Reset fault counter
+  EEPROM.write(EEPROM_FAULT_COUNT_ADDR, 0);
+  EEPROM.write(EEPROM_FAULT_COUNT_ADDR + 1, 0);
+  
+  // Clear fault log area (optional)
+  for (int i = 0; i < MAX_FAULT_LOGS * 16; i++) {
+    EEPROM.write(EEPROM_FAULT_LOG_START + i, 0);
+  }
+  
+  EEPROM.commit();
+  Serial.println("Fault history cleared");
+}
+
+// Function to periodically save energy data to non-volatile memory (Enhanced Option)
+void saveEnergyData() {
+  static unsigned long lastSaveTime = 0;
+  const unsigned long saveInterval = 3600000; // Save energy data hourly
+  
+  if (millis() - lastSaveTime >= saveInterval) {
+    // Define EEPROM addresses for energy data (after fault logs)
+    const int ENERGY_DATA_ADDR = EEPROM_FAULT_LOG_START + (MAX_FAULT_LOGS * 16) + 16;
+    
+    // Convert total energy floats to bytes and save
+    for (int i = 0; i < 3; i++) {
+      uint32_t energyInt = *(uint32_t*)&totalEnergy[i];
+      for (int j = 0; j < 4; j++) {
+        EEPROM.write(ENERGY_DATA_ADDR + (i * 4) + j, (energyInt >> (j * 8)) & 0xFF);
+      }
+    }
+    
+    // Also save peak demand
+    uint32_t peakDemandInt = *(uint32_t*)&peakDemand;
+    for (int j = 0; j < 4; j++) {
+      EEPROM.write(ENERGY_DATA_ADDR + 12 + j, (peakDemandInt >> (j * 8)) & 0xFF);
+    }
+    
+    EEPROM.commit();
+    lastSaveTime = millis();
+    Serial.println("Energy data saved to EEPROM");
+  }
+}
+
+// Function to load energy data from non-volatile memory at startup (Enhanced Option)
+void loadEnergyData() {
+  // Define EEPROM addresses for energy data (same as in saveEnergyData)
+  const int ENERGY_DATA_ADDR = EEPROM_FAULT_LOG_START + (MAX_FAULT_LOGS * 16) + 16;
+  
+  // Read energy data
+  for (int i = 0; i < 3; i++) {
+    uint32_t energyInt = 0;
+    for (int j = 0; j < 4; j++) {
+      energyInt |= ((uint32_t)EEPROM.read(ENERGY_DATA_ADDR + (i * 4) + j)) << (j * 8);
+    }
+    totalEnergy[i] = *(float*)&energyInt;
+  }
+  
+  // Read peak demand
+  uint32_t peakDemandInt = 0;
+  for (int j = 0; j < 4; j++) {
+    peakDemandInt |= ((uint32_t)EEPROM.read(ENERGY_DATA_ADDR + 12 + j)) << (j * 8);
+  }
+  peakDemand = *(float*)&peakDemandInt;
+  
+  Serial.printf("Loaded energy data: L1=%.1fWh, L2=%.1fWh, L3=%.1fWh, Peak=%.1fW\n",
+               totalEnergy[0], totalEnergy[1], totalEnergy[2], peakDemand);
+}
